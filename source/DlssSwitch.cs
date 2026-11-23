@@ -1,10 +1,12 @@
-﻿// FC 27 DLSS Switch v1.2
+﻿// FC 27 DLSS Switch v1.3
 // Switches DLSS Super Resolution / DLAA and the engine's own AMD FSR 3 upscaler in EA SPORTS FC 27 at runtime
 // via global hotkeys and a tray menu. FSR 3 runs on every GPU; DLSS is offered only when an NVIDIA GPU is present.
 // It writes the upscaler mode into the game's WorldRenderSettings objects. Field offsets, enum values and the
 // objects' vtables are looked up by name in the engine's reflection data, so the tool adapts to game updates.
 // v1.2: every object is identified by its type and checked field by field (flags, enums, floats), looked at twice
 // before the first write and checked again before every write; addresses from earlier sessions are never reused.
+// v1.3: only the settings of the main game view are changed (other views such as reflections and previews are left
+// alone), and settings that appear later get a longer second look - against crashes while a match loads.
 // Requires the NVIDIA Streamline/DLSS DLLs in the game folder (installed by Installieren.bat).
 // Compiles with the C# 5 compiler that ships with Windows (.NET Framework 4.x), see build.ps1.
 
@@ -24,8 +26,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("FC 27 DLSS Switch")]
 [assembly: AssemblyProduct("FC 27 DLSS Mod")]
 [assembly: AssemblyDescription("DLSS / DLAA / FSR 3 switch for EA SPORTS FC 27")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 public static class Program
 {
@@ -141,6 +143,7 @@ public class WrsLayout
     public string Source = "";
     public bool Strong;          // true = every flag / enum / float field of the class is checked (engine data available)
     public WrsLayout Full;       // the complete engine layout when this one is limited to a smaller window (diagnostics)
+    public Dictionary<string, int> BoolByName = new Dictionary<string, int>();   // Boolean field name -> offset (engine data only)
 
     static uint U32(byte[] b, int o) { return BitConverter.ToUInt32(b, o); }
 
@@ -519,7 +522,7 @@ public class Resolver
             {
                 if (f.Offset + 4 > (uint)L.Size || seen.ContainsKey(f.Offset)) continue;
                 seen[f.Offset] = true;
-                if (f.TypeName == boolName) L.Bools.Add((int)f.Offset);
+                if (f.TypeName == boolName) { L.Bools.Add((int)f.Offset); if (!L.BoolByName.ContainsKey(f.Name)) L.BoolByName[f.Name] = (int)f.Offset; }
                 else if (f.TypeName == "Float32") L.Floats.Add((int)f.Offset);
                 else if (enums.ContainsKey(f.TypeName) && enums[f.TypeName].Count > 0)
                 {
@@ -555,6 +558,8 @@ public class Config
     public bool Osd = true;
     public int OsdX = 24, OsdY = 24;
     public bool NoDefaults = false;
+    public bool MainViewOnly = true;     // change only the settings of the main game view (not reflections, previews, ...)
+    public bool LogObjects = true;       // write one line per settings object to the log (for troubleshooting)
     static readonly string[] KeyIds = { "key_toggle", "key_ultraperformance", "key_performance", "key_balanced", "key_quality", "key_native", "key_status", "key_upscaler" };
     static readonly string[] KeyIdsDe = { "taste_anaus", "taste_ultraperformance", "taste_performance", "taste_balanced", "taste_quality", "taste_dlaa", "taste_status", "taste_upscaler" };
 
@@ -588,6 +593,8 @@ public class Config
                 else if (key == "osd_x") { if (int.TryParse(val, out iv)) c.OsdX = iv; }
                 else if (key == "osd_y") { if (int.TryParse(val, out iv)) c.OsdY = iv; }
                 else if (key == "nodefaults" || key == "ohnevorgaben") c.NoDefaults = val == "1";
+                else if (key == "mainviewonly") c.MainViewOnly = val != "0";
+                else if (key == "logobjects") c.LogObjects = val != "0";
                 else if (key == "gpu" || key == "grafikkarte")
                 {
                     string g = val.ToLowerInvariant();
@@ -640,7 +647,7 @@ public class Config
     }
 
     const string DefaultText =
-        "; FC 27 DLSS Switch v1.2 - settings\n" +
+        "; FC 27 DLSS Switch v1.3 - settings\n" +
         "; Changes take effect after restarting the switch (tray icon > Exit, then start it again).\n" +
         ";\n" +
         "; Modifier: Ctrl, Alt, Shift, Win or None (can be combined with +, e.g. Ctrl+Alt)\n" +
@@ -666,6 +673,13 @@ public class Config
         "OSD_X=24\n" +
         "OSD_Y=24\n" +
         "\n" +
+        "; 1 = DLSS / FSR 3 only for the main game view (recommended, avoids crashes when a match loads)\n" +
+        "; 0 = for every view, like version 1.2\n" +
+        "MainViewOnly=1\n" +
+        "\n" +
+        "; 1 = write one line per graphics settings object to the log (helps with troubleshooting)\n" +
+        "LogObjects=1\n" +
+        "\n" +
         "; Testing only: 1 = ignore saved and built-in memory addresses and search everything again\n" +
         "NoDefaults=0\n";
 }
@@ -683,6 +697,12 @@ public class DlssSwitch : Form
     const string WRS_NAME = "WorldRenderSettings";
     const int MAX_TARGETS = 256;         // FC 27 keeps 60+ copies of the settings at times; this is only a sanity limit
     const int SETTLE_MS = 500;           // a found object must stay unchanged this long before it is written to
+    const int CHECK_WINDOW = 0x2E8;      // the part of a settings object that is checked (holds every field the switch uses)
+    const int SETTLE_LATE_MS = 2000;     // ... and this long when it appears later, while the game builds a new scene
+    const int LATE_AFTER_MS = 30000;     // objects found after this time count as "later"
+    const int LOG_OBJECTS_MAX = 150;     // object lines per game session
+    static readonly string[] MainViewFields = { "FinalPostEnable", "SkyRenderEnable", "DistortionEnable" };
+    static readonly string[] LogViewFields = { "FinalPostEnable", "SkyRenderEnable", "DistortionEnable", "HalfResEnable", "DynamicEnvmapEnable" };
 
     // Upscaler families: 0 = NVIDIA DLSS (through Streamline), 1 = AMD FSR 3 (built into the engine, runs on every GPU).
     const int FAM_DLSS = 0, FAM_FSR = 1;
@@ -711,13 +731,19 @@ public class DlssSwitch : Form
     Dictionary<ulong, ulong> targets = new Dictionary<ulong, ulong>();     // object address -> its vtable (verified, written to)
     Dictionary<ulong, Cand> pending = new Dictionary<ulong, Cand>();       // found, waiting for the second look
     Dictionary<ulong, int> strikes = new Dictionary<ulong, int>();         // addresses that failed the second look
+    Dictionary<ulong, ulong> sideViews = new Dictionary<ulong, ulong>();   // settings of other views, left alone -> vtable
+    long nextSideCheck;
     Dictionary<ulong, bool> vtables = new Dictionary<ulong, bool>();
     List<ulong[]> regions = new List<ulong[]>();
     readonly Stopwatch clock = Stopwatch.StartNew();
+    Stopwatch sessionClock = Stopwatch.StartNew();
+    ulong procBase;
+    List<int> viewOffs = new List<int>();            // MainViewFields offsets (empty = filter off)
+    int objectLines;
     volatile bool typesConfirmed, relaxRequested;
     volatile int relaxVotes;
 
-    class Cand { public ulong Vt; public byte[] Snap; public long Seen; }
+    class Cand { public ulong Vt; public byte[] Snap; public long Seen; public bool Late; }
 
     static string ModeName(int f, int m) { return f == FAM_FSR ? FsrNames[m] : DlssNames[m]; }
 
@@ -728,7 +754,7 @@ public class DlssSwitch : Form
         logPath = Path.Combine(dir, "FC27_DLSS_Switch_log.txt");
         cachePath = Path.Combine(dir, "FC27_DLSS_Switch_cache.txt");
         iniPath = Path.Combine(dir, "FC27_DLSS_Switch.ini");
-        try { File.WriteAllText(logPath, "FC 27 DLSS Switch v1.2  " + DateTime.Now.ToString("s") + Environment.NewLine); } catch { }
+        try { File.WriteAllText(logPath, "FC 27 DLSS Switch v1.3  " + DateTime.Now.ToString("s") + Environment.NewLine); } catch { }
         cfg = Config.Load(iniPath, Log);
         DetectGpu();
         LoadState();
@@ -758,7 +784,7 @@ public class DlssSwitch : Form
         try { tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { tray.Icon = SystemIcons.Application; }
         tray.Text = "FC 27 DLSS Switch";
         ContextMenu cm = new ContextMenu();
-        MenuItem title = new MenuItem("FC 27 DLSS Switch v1.2");
+        MenuItem title = new MenuItem("FC 27 DLSS Switch v1.3");
         title.Enabled = false;
         cm.MenuItems.Add(title);
         MenuItem hint = new MenuItem("Level: " + cfg.KeyText(1) + " to " + cfg.KeyText(5) + ",  on/off: " + cfg.KeyText(0));
@@ -1083,6 +1109,7 @@ public class DlssSwitch : Form
                         c.Snap = new byte[L.Size];
                         Buffer.BlockCopy(src, at, c.Snap, 0, L.Size);
                         c.Seen = clock.ElapsedMilliseconds;
+                        c.Late = sessionClock.ElapsedMilliseconds >= LATE_AFTER_MS;
                         pending[o] = c;
                         found++;
                     }
@@ -1258,9 +1285,9 @@ public class DlssSwitch : Form
     {
         long now = clock.ElapsedMilliseconds;
         List<KeyValuePair<ulong, Cand>> due = new List<KeyValuePair<ulong, Cand>>();
-        lock (setLock) foreach (KeyValuePair<ulong, Cand> kv in pending) if (now - kv.Value.Seen >= SETTLE_MS) due.Add(kv);
+        lock (setLock) foreach (KeyValuePair<ulong, Cand> kv in pending) if (now - kv.Value.Seen >= (kv.Value.Late ? SETTLE_LATE_MS : SETTLE_MS)) due.Add(kv);
         if (due.Count == 0) return;
-        int added = 0, rejected = 0, capped = 0, fullOk = 0;
+        int added = 0, rejected = 0, capped = 0, fullOk = 0, side = 0;
         foreach (KeyValuePair<ulong, Cand> kv in due)
         {
             ulong o = kv.Key;
@@ -1279,6 +1306,8 @@ public class DlssSwitch : Form
                 ok = same * 100 >= tot * 95;
             }
             if (ok && !L.Strong && PointerLike(p, b, L)) ok = false;
+            bool main = ok && IsMainView(b);
+            if (ok) LogObject(o, c.Vt, b, L, main ? "" : "  -> other view, left alone");
             lock (setLock)
             {
                 pending.Remove(o);
@@ -1290,6 +1319,7 @@ public class DlssSwitch : Form
                     rejected++;
                     continue;
                 }
+                if (!main) { strikes[o] = 99; sideViews[o] = c.Vt; side++; continue; }
                 if (targets.Count >= MAX_TARGETS) { capped++; continue; }
                 targets[o] = c.Vt;
                 added++;
@@ -1302,11 +1332,49 @@ public class DlssSwitch : Form
         }
         int total;
         lock (setLock) total = targets.Count;
+        if (side > 0) Log("Settings objects: " + side + " of another view (reflection, preview, ...) left alone");
         if (added > 0 || rejected > 0 || capped > 0)
             Log("Settings objects: " + added + " accepted" +
                 (L.Full != null && added > 0 ? " (" + fullOk + " of them also match the full 0x" + L.Full.Size.ToString("X") + " layout)" : "") +
                 ", " + rejected + " rejected at the second look" + (capped > 0 ? ", " + capped + " over the limit of " + MAX_TARGETS : "") +
                 " - " + total + " in use");
+    }
+    // Settings of the main game view have the final post-processing, the sky and distortion switched on. Other views
+    // (reflections, previews, offscreen renders) have some of them off; they are left alone, because switching them to
+    // DLSS / FSR 3 can crash the game while it builds a new scene.
+    bool IsMainView(byte[] b)
+    {
+        foreach (int off in viewOffs) if (off < b.Length && b[off] != 1) return false;
+        return true;
+    }
+    void LogObject(ulong o, ulong vt, byte[] b, WrsLayout L, string note)
+    {
+        if (!cfg.LogObjects || objectLines >= LOG_OBJECTS_MAX) return;
+        objectLines++;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("Object 0x" + o.ToString("X") + " type 0x" + (vt - procBase).ToString("X") + " at " + (sessionClock.ElapsedMilliseconds / 1000) + " s: Up=0x" + U32(b, L.OffUp).ToString("X") + " FS=" + U32(b, L.OffFs));
+        foreach (string n in LogViewFields)
+        {
+            int off;
+            if (L.BoolByName.TryGetValue(n, out off) && off < b.Length) sb.Append(" " + n.Replace("Enable", "") + "=" + b[off]);
+        }
+        sb.Append(note);
+        if (objectLines == LOG_OBJECTS_MAX) sb.Append("  (no more object lines in this session)");
+        Log(sb.ToString());
+    }
+    // Other views are checked once a second. When one is freed or replaced, its memory may later hold new settings,
+    // so the address is searched again. If it turns into a main view, it is searched again as well.
+    void CheckSideViews(Proc p, WrsLayout L)
+    {
+        List<KeyValuePair<ulong, ulong>> list;
+        lock (setLock) list = new List<KeyValuePair<ulong, ulong>>(sideViews);
+        foreach (KeyValuePair<ulong, ulong> kv in list)
+        {
+            byte[] b = p.Read(kv.Key, L.Size);
+            bool valid = b != null && U64(b, 0) == kv.Value && L.Check(b, 0, p);
+            if (valid && !IsMainView(b)) continue;
+            lock (setLock) { sideViews.Remove(kv.Key); strikes.Remove(kv.Key); }
+        }
     }
     // Only used without engine field data: refuse an object if a field we would write to is part of
     // something that looks like a pointer to committed memory.
@@ -1334,22 +1402,31 @@ public class DlssSwitch : Form
         if (useFsr && !L.HasFsr) md = 0;    // FSR 3 not found in this game version: leave the game's own TAA
         uint upWant = md == 0 ? 0 : (useFsr ? L.UpFsr[md] : L.Up[md]);
         uint fsWant = md == 0 ? L.FsNone : L.FsTu;
-        int dropped = 0;
+        int dropped = 0, switched = 0;
         foreach (KeyValuePair<ulong, ulong> kv in list)
         {
             ulong o = kv.Key;
             // check the object again right before every write: if it was freed or replaced, leave it alone
             byte[] b = p.Read(o, L.Size);
             if (b == null || U64(b, 0) != kv.Value || !L.Check(b, 0, p)) { lock (setLock) targets.Remove(o); dropped++; continue; }
+            if (!IsMainView(b))
+            {
+                // the game reused these settings for another view: put back the game's TAA and leave them alone
+                if (U32(b, L.OffFs) != L.FsNone) p.Write32(o + (ulong)L.OffFs, L.FsNone);
+                lock (setLock) { targets.Remove(o); strikes[o] = 99; sideViews[o] = kv.Value; }
+                switched++;
+                continue;
+            }
             if (U32(b, L.OffFs) != fsWant) p.Write32(o + (ulong)L.OffFs, fsWant);
             if (md != 0 && U32(b, L.OffUp) != upWant) p.Write32(o + (ulong)L.OffUp, upWant);
             if (U32(b, L.OffFg) != L.FgOff) p.Write32(o + (ulong)L.OffFg, L.FgOff);
         }
-        if (dropped > 0)
+        if (dropped > 0 || switched > 0)
         {
             int n;
             lock (setLock) n = targets.Count;
-            Log("Settings objects: " + dropped + " no longer valid and dropped - " + n + " in use");
+            if (switched > 0) Log("Settings objects: " + switched + " now belong to another view - set back to TAA and left alone");
+            if (dropped > 0) Log("Settings objects: " + dropped + " no longer valid and dropped - " + n + " in use");
         }
     }
 
@@ -1415,6 +1492,7 @@ public class DlssSwitch : Form
         if (pe <= 0 || pe > 0xE00 || U32(hdr, pe) != 0x4550) { Log("PE header unreadable"); return; }
         uint stamp = U32(hdr, pe + 8);
         p.Base = imgBase;
+        procBase = imgBase;
         p.ImgSize = U32(hdr, pe + 24 + 56);
 
         // The launcher starts FC27.exe once briefly and then restarts it - skip that short-lived instance.
@@ -1471,11 +1549,41 @@ public class DlssSwitch : Form
             }
             else Log("Engine analysis matches the known values.");
         }
+        else if (L.Strong && L.Size > CHECK_WINDOW && L.Full == null)
+        {
+            // Other game versions: the engine describes the whole object (0x910 bytes in FC 27). Live objects can hold
+            // values in the back part that do not fit the field types, so a check over the whole object rejects real
+            // settings (the switch then has no visible effect). As with the known version, the checks use the first
+            // 0x2E8 bytes, which hold every field the switch reads or writes.
+            int[] need = { L.OffUp, L.OffFs, L.OffFg, L.OffN, L.OffCs };
+            bool fits = true;
+            foreach (int o in need) if (o + 4 > CHECK_WINDOW) fits = false;
+            foreach (string n in MainViewFields) { int off; if (L.BoolByName.TryGetValue(n, out off) && off >= CHECK_WINDOW) fits = false; }
+            if (fits)
+            {
+                Log("Engine analysis: full object 0x" + L.Size.ToString("X") + " bytes (" + L.Counts() + ") - the checks use the first 0x" + CHECK_WINDOW.ToString("X") + " bytes");
+                L = L.Window(CHECK_WINDOW);
+            }
+        }
         Log("Layout: " + L.Source + "  Up=0x" + L.OffUp.ToString("X") + " FS=0x" + L.OffFs.ToString("X") + " FG=0x" + L.OffFg.ToString("X") +
             " N=0x" + L.OffN.ToString("X") + " CS=0x" + L.OffCs.ToString("X") + " size=0x" + L.Size.ToString("X") +
             "  DLSS values " + L.Up[1].ToString("X") + "/" + L.Up[2].ToString("X") + "/" + L.Up[3].ToString("X") + "/" + L.Up[4].ToString("X") + "/" + L.Up[5].ToString("X") +
             "  FSR3 values " + (L.HasFsr ? L.UpFsr[1].ToString("X") + "/" + L.UpFsr[2].ToString("X") + "/" + L.UpFsr[3].ToString("X") + "/" + L.UpFsr[4].ToString("X") + "/" + L.UpFsr[5].ToString("X") : "missing"));
         Log("Checks: " + (L.Strong ? "full field check (" + L.Counts() + ")" : "basic check only (no field data)"));
+        sessionClock = life;
+        objectLines = 0;
+        viewOffs = new List<int>();
+        if (cfg.MainViewOnly)
+        {
+            foreach (string n in MainViewFields)
+            {
+                int off;
+                if (L.BoolByName.TryGetValue(n, out off) && off < L.Size) viewOffs.Add(off);
+            }
+            if (viewOffs.Count == MainViewFields.Length) Log("Main view only: DLSS / FSR 3 is set only where " + string.Join(", ", MainViewFields) + " are on");
+            else { viewOffs.Clear(); Log("Main view only: fields not found in this game version - every view is changed"); }
+        }
+        else Log("Main view only: off (MainViewOnly=0) - every view is changed");
 
         List<ulong> vtRva = new List<ulong>();
         if (cfg.NoDefaults) Log("Test mode: without saved and built-in object types");
@@ -1498,7 +1606,7 @@ public class DlssSwitch : Form
         relaxVotes = 0;
         lock (setLock)
         {
-            targets.Clear(); pending.Clear(); strikes.Clear(); regions.Clear(); vtables.Clear();
+            targets.Clear(); pending.Clear(); strikes.Clear(); regions.Clear(); vtables.Clear(); sideViews.Clear();
             foreach (ulong v in accepted.Keys) vtables[v] = true;
         }
         if (vtRva.Count > 0 && accepted.Count == 0)
@@ -1596,6 +1704,7 @@ public class DlssSwitch : Form
 
             Promote(p, L);
             Enforce(p, L);
+            if (clock.ElapsedMilliseconds >= nextSideCheck) { nextSideCheck = clock.ElapsedMilliseconds + 1000; CheckSideViews(p, L); }
             int n;
             lock (setLock) n = targets.Count;
             if (n > 0 && !cached) { cached = true; SaveCache(stamp, imgBase); }
