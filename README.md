@@ -16,7 +16,7 @@ It does this by changing three 4-byte values (upscaler mode, frame synthesis mod
 
 ## How it works (for reviewers)
 
-- Everything is in one C# file, [`source/DlssSwitch.cs`](source/DlssSwitch.cs) (about 1,600 lines, .NET Framework 4, no third-party libraries).
+- Everything is in one C# file, [`source/DlssSwitch.cs`](source/DlssSwitch.cs) (about 1,700 lines, .NET Framework 4, no third-party libraries).
 - It opens `FC27.exe` with `OpenProcess` (`PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION`).
 - It reads the game's own type information (class, field and enum names) to find where the settings are. Then it searches
   the game's memory for those objects with `ReadProcessMemory` / `VirtualQueryEx`. Every object is checked field by field and
