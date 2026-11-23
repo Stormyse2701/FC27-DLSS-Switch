@@ -1,4 +1,4 @@
-# FC 27 DLSS Mod v1.2 - Install.
+# FC 27 DLSS Mod v1.3 - Install.
 # Copies the official NVIDIA Streamline 2.14.16 / DLSS DLLs (unchanged, signed by NVIDIA) into the FC 27 folder.
 $ErrorActionPreference = 'Stop'
 $files = Split-Path -Parent $MyInvocation.MyCommand.Path
